@@ -1,7 +1,7 @@
 # ============================================================
-# INSTITUTIONAL MT5 EXECUTION BRIDGE (PRODUCTION GRADE)
-# Google Cloud Deployment Version
-# Compatible with Remote AccountConnector (Oracle Cloud)
+# INSTITUTIONAL MT5 EXECUTION BRIDGE (PRODUCTION SAFE)
+# Google Cloud Deployment
+# Compatible with Remote Oracle AccountConnector
 # ============================================================
 
 import os
@@ -95,6 +95,8 @@ metrics = {
     "last_tick_time": 0.0,
 }
 
+_threads_started = False
+
 # ============================================================
 # MT5 CONNECTION
 # ============================================================
@@ -126,7 +128,7 @@ def init_mt5():
         for s in SYMBOLS:
             mt5.symbol_select(s, True)
 
-        logger.info("MT5 connected successfully")
+        logger.info("MT5 connected")
 
 def shutdown_mt5():
     global mt5_connected
@@ -134,7 +136,7 @@ def shutdown_mt5():
         if mt5_connected:
             mt5.shutdown()
             mt5_connected = False
-            logger.warning("MT5 shutdown executed")
+            logger.warning("MT5 shutdown")
 
 def watchdog():
     global mt5_connected
@@ -143,8 +145,9 @@ def watchdog():
         try:
             with mt5_lock:
                 terminal = mt5.terminal_info()
-                if not terminal:
-                    mt5_connected = False
+
+            if not terminal:
+                mt5_connected = False
 
             if not mt5_connected:
                 metrics["mt5_reconnects"] += 1
@@ -158,7 +161,7 @@ def watchdog():
         time.sleep(WATCHDOG_INTERVAL)
 
 # ============================================================
-# TICK ENGINE
+# TICK LOOP
 # ============================================================
 
 def tick_loop():
@@ -203,7 +206,7 @@ def tick_loop():
         time.sleep(TICK_POLL_INTERVAL)
 
 # ============================================================
-# POSITION TRACKER
+# POSITION LOOP
 # ============================================================
 
 def execution_loop():
@@ -256,15 +259,16 @@ def account_loop():
                 info = mt5.account_info()
 
             if info:
-                account_snapshot = {
+                snapshot = {
                     "balance": info.balance,
                     "equity": info.equity,
                     "free_margin": info.margin_free,
-                    "margin": info.margin,
                     "leverage": info.leverage,
                     "currency": info.currency,
                     "is_demo": info.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO,
                 }
+
+                account_snapshot = snapshot
 
         except Exception as e:
             logger.error(f"Account loop error: {e}")
@@ -291,7 +295,7 @@ class OrderRequest(BaseModel):
     tp: float
 
 # ============================================================
-# ORDER ENGINE
+# ORDER ENDPOINT
 # ============================================================
 
 @app.post("/order")
@@ -320,17 +324,6 @@ def send_order(req: OrderRequest, x_api_key: str = Header(None)):
     if spread > MAX_SPREAD_POINTS:
         raise HTTPException(400, detail={"error": BridgeErrorCode.SPREAD_TOO_WIDE})
 
-    with mt5_lock:
-        margin_check = mt5.order_calc_margin(
-            mt5.ORDER_TYPE_BUY,
-            req.symbol,
-            req.volume,
-            tick.ask
-        )
-
-    if margin_check and margin_check > account_snapshot.get("free_margin", 0):
-        raise HTTPException(400, detail={"error": BridgeErrorCode.MARGIN_INSUFFICIENT})
-
     price = tick.ask if req.type == mt5.ORDER_TYPE_BUY else tick.bid
 
     request = {
@@ -357,20 +350,14 @@ def send_order(req: OrderRequest, x_api_key: str = Header(None)):
         metrics["avg_order_latency_ms"] * 0.9 + latency * 0.1
     )
 
-    if not result:
-        raise HTTPException(500, detail={"error": BridgeErrorCode.BROKER_REJECT})
-
-    if latency > MAX_ORDER_LATENCY_MS:
-        circuit_breaker = True
-
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
+    if not result or result.retcode != mt5.TRADE_RETCODE_DONE:
         reject_counter += 1
         if reject_counter >= MAX_REJECTS_BEFORE_HALT:
             circuit_breaker = True
 
         raise HTTPException(400, detail={
             "error": BridgeErrorCode.BROKER_REJECT,
-            "retcode": result.retcode
+            "retcode": getattr(result, "retcode", None)
         })
 
     reject_counter = 0
@@ -404,12 +391,20 @@ def heartbeat():
     }
 
 # ============================================================
-# START THREADS (SAFE SINGLE INIT)
+# START THREADS (SAFE)
 # ============================================================
 
-init_mt5()
+def start_background_threads():
+    global _threads_started
+    if _threads_started:
+        return
+    _threads_started = True
 
-threading.Thread(target=watchdog, daemon=True).start()
-threading.Thread(target=tick_loop, daemon=True).start()
-threading.Thread(target=execution_loop, daemon=True).start()
-threading.Thread(target=account_loop, daemon=True).start()
+    init_mt5()
+
+    threading.Thread(target=watchdog, daemon=True).start()
+    threading.Thread(target=tick_loop, daemon=True).start()
+    threading.Thread(target=execution_loop, daemon=True).start()
+    threading.Thread(target=account_loop, daemon=True).start()
+
+start_background_threads()
