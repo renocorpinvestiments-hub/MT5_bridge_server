@@ -10,7 +10,7 @@ import threading
 import logging
 from collections import deque
 from enum import Enum
-from typing import Optional, Dict, Set, Any
+from typing import Optional, Dict, Set, Any, List
 
 import MetaTrader5 as mt5
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -27,10 +27,11 @@ MT5_SERVER = os.getenv("MT5_SERVER", "")
 API_KEY = os.getenv("BRIDGE_API_KEY", "CHANGE_ME")
 MAGIC_NUMBER = int(os.getenv("MAGIC_NUMBER", "123456"))
 
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "EURUSD,GBPUSD,XAUUSD").split(",")]
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS",
+           "EURUSD,GBPUSD,XAUUSD").split(",")]
 
-TICK_BUFFER_SIZE = 50000
-UPDATE_BUFFER_SIZE = 20000
+TICK_BUFFER_SIZE = 100_000          # increased
+UPDATE_BUFFER_SIZE = 50_000         # increased
 
 TICK_POLL_INTERVAL = 0.01
 POSITION_POLL_INTERVAL = 0.25
@@ -69,7 +70,7 @@ class BridgeErrorCode(str, Enum):
 # APP + STATE
 # ============================================================
 
-app = FastAPI()
+app = FastAPI(title="MT5 Execution Bridge", version="2.0")
 
 tick_buffer = deque(maxlen=TICK_BUFFER_SIZE)
 update_buffer = deque(maxlen=UPDATE_BUFFER_SIZE)
@@ -128,7 +129,7 @@ def init_mt5():
         for s in SYMBOLS:
             mt5.symbol_select(s, True)
 
-        logger.info("MT5 connected")
+        logger.info("MT5 connected and symbols activated")
 
 def shutdown_mt5():
     global mt5_connected
@@ -161,7 +162,7 @@ def watchdog():
         time.sleep(WATCHDOG_INTERVAL)
 
 # ============================================================
-# TICK LOOP
+# TICK LOOP (SOURCE OF MARKET DATA)
 # ============================================================
 
 def tick_loop():
@@ -206,7 +207,7 @@ def tick_loop():
         time.sleep(TICK_POLL_INTERVAL)
 
 # ============================================================
-# POSITION LOOP
+# POSITION LOOP (TRADE STATUS)
 # ============================================================
 
 def execution_loop():
@@ -243,7 +244,7 @@ def execution_loop():
         time.sleep(POSITION_POLL_INTERVAL)
 
 # ============================================================
-# ACCOUNT LOOP
+# ACCOUNT LOOP (BALANCE / EQUITY)
 # ============================================================
 
 def account_loop():
@@ -259,16 +260,15 @@ def account_loop():
                 info = mt5.account_info()
 
             if info:
-                snapshot = {
+                account_snapshot = {
                     "balance": info.balance,
                     "equity": info.equity,
                     "free_margin": info.margin_free,
                     "leverage": info.leverage,
                     "currency": info.currency,
                     "is_demo": info.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO,
+                    "timestamp": time.time(),
                 }
-
-                account_snapshot = snapshot
 
         except Exception as e:
             logger.error(f"Account loop error: {e}")
@@ -295,7 +295,62 @@ class OrderRequest(BaseModel):
     tp: float
 
 # ============================================================
-# ORDER ENDPOINT
+# NEW: TICKS ENDPOINT (FIX FOR YOUR BOT)
+# ============================================================
+
+@app.get("/ticks")
+def get_ticks(
+    after_seq: int = Query(0, ge=0),
+    limit: int = Query(MAX_TICKS_PER_RESPONSE, le=MAX_TICKS_PER_RESPONSE),
+    x_api_key: str = Header(None),
+):
+    require_auth(x_api_key)
+
+    with tick_lock:
+        items = [t for t in tick_buffer if t["seq"] > after_seq]
+
+    return {
+        "ticks": items[:limit],
+        "next_seq": tick_seq,
+        "count": len(items[:limit]),
+    }
+
+# ============================================================
+# NEW: UPDATES ENDPOINT (FIX FOR YOUR BOT)
+# ============================================================
+
+@app.get("/updates")
+def get_updates(
+    after_seq: int = Query(0, ge=0),
+    limit: int = Query(MAX_UPDATES_PER_RESPONSE, le=MAX_UPDATES_PER_RESPONSE),
+    x_api_key: str = Header(None),
+):
+    require_auth(x_api_key)
+
+    with update_lock:
+        items = [u for u in update_buffer if u["seq"] > after_seq]
+
+    return {
+        "updates": items[:limit],
+        "next_seq": update_seq,
+        "count": len(items[:limit]),
+    }
+
+# ============================================================
+# NEW: ACCOUNT ENDPOINT (FIX FOR YOUR BOT)
+# ============================================================
+
+@app.get("/account")
+def get_account(x_api_key: str = Header(None)):
+    require_auth(x_api_key)
+
+    if not account_snapshot:
+        raise HTTPException(503, detail={"error": "ACCOUNT_NOT_READY"})
+
+    return account_snapshot
+
+# ============================================================
+# ORDER ENDPOINT (UNCHANGED CORE, SAFER)
 # ============================================================
 
 @app.post("/order")
