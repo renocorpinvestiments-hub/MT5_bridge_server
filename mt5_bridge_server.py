@@ -1,5 +1,7 @@
 # ============================================================
-# INSTITUTIONAL MT5 EXECUTION BRIDGE (FINAL)
+# INSTITUTIONAL MT5 EXECUTION BRIDGE (PRODUCTION GRADE)
+# Google Cloud Deployment Version
+# Compatible with Remote AccountConnector (Oracle Cloud)
 # ============================================================
 
 import os
@@ -8,7 +10,7 @@ import threading
 import logging
 from collections import deque
 from enum import Enum
-from typing import Optional, Dict, Set
+from typing import Optional, Dict, Set, Any
 
 import MetaTrader5 as mt5
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -25,7 +27,7 @@ MT5_SERVER = os.getenv("MT5_SERVER", "")
 API_KEY = os.getenv("BRIDGE_API_KEY", "CHANGE_ME")
 MAGIC_NUMBER = int(os.getenv("MAGIC_NUMBER", "123456"))
 
-SYMBOLS = os.getenv("SYMBOLS", "EURUSD,GBPUSD,XAUUSD").split(",")
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "EURUSD,GBPUSD,XAUUSD").split(",")]
 
 TICK_BUFFER_SIZE = 50000
 UPDATE_BUFFER_SIZE = 20000
@@ -74,7 +76,7 @@ update_buffer = deque(maxlen=UPDATE_BUFFER_SIZE)
 
 tick_lock = threading.Lock()
 update_lock = threading.Lock()
-mt5_lock = threading.Lock()
+mt5_lock = threading.RLock()
 
 tick_seq = 0
 update_seq = 0
@@ -84,7 +86,7 @@ mt5_connected = False
 circuit_breaker = False
 reject_counter = 0
 
-account_snapshot: Dict[str, any] = {}
+account_snapshot: Dict[str, Any] = {}
 
 metrics = {
     "last_order_latency_ms": 0.0,
@@ -101,6 +103,11 @@ def init_mt5():
     global mt5_connected
 
     with mt5_lock:
+        if mt5_connected:
+            return
+
+        logger.info("Initializing MT5 connection...")
+
         if MT5_LOGIN:
             connected = mt5.initialize(
                 login=MT5_LOGIN,
@@ -110,28 +117,48 @@ def init_mt5():
         else:
             connected = mt5.initialize()
 
-    mt5_connected = bool(connected)
+        mt5_connected = bool(connected)
 
-    if mt5_connected:
-        logger.info("MT5 connected")
+        if not mt5_connected:
+            logger.error(f"MT5 init failed: {mt5.last_error()}")
+            return
+
         for s in SYMBOLS:
             mt5.symbol_select(s, True)
-    else:
-        logger.error("MT5 connection failed")
+
+        logger.info("MT5 connected successfully")
+
+def shutdown_mt5():
+    global mt5_connected
+    with mt5_lock:
+        if mt5_connected:
+            mt5.shutdown()
+            mt5_connected = False
+            logger.warning("MT5 shutdown executed")
 
 def watchdog():
     global mt5_connected
 
     while True:
-        with mt5_lock:
-            if not mt5.terminal_info():
-                mt5_connected = False
+        try:
+            with mt5_lock:
+                terminal = mt5.terminal_info()
+                if not terminal:
+                    mt5_connected = False
+
+            if not mt5_connected:
                 metrics["mt5_reconnects"] += 1
+                shutdown_mt5()
+                time.sleep(2)
                 init_mt5()
+
+        except Exception as e:
+            logger.error(f"Watchdog error: {e}")
+
         time.sleep(WATCHDOG_INTERVAL)
 
 # ============================================================
-# TICK ENGINE (LOSSLESS)
+# TICK ENGINE
 # ============================================================
 
 def tick_loop():
@@ -145,29 +172,33 @@ def tick_loop():
             continue
 
         for symbol in SYMBOLS:
-            with mt5_lock:
-                tick = mt5.symbol_info_tick(symbol)
+            try:
+                with mt5_lock:
+                    tick = mt5.symbol_info_tick(symbol)
 
-            if not tick:
-                continue
+                if not tick:
+                    continue
 
-            if last_ts.get(symbol) == tick.time:
-                continue
+                if last_ts.get(symbol) == tick.time:
+                    continue
 
-            last_ts[symbol] = tick.time
+                last_ts[symbol] = tick.time
 
-            with tick_lock:
-                tick_seq += 1
-                tick_buffer.append({
-                    "seq": tick_seq,
-                    "symbol": symbol,
-                    "ts": float(tick.time),
-                    "bid": tick.bid,
-                    "ask": tick.ask,
-                    "volume": tick.volume_real or 0.0,
-                })
+                with tick_lock:
+                    tick_seq += 1
+                    tick_buffer.append({
+                        "seq": tick_seq,
+                        "symbol": symbol,
+                        "ts": float(tick.time),
+                        "bid": tick.bid,
+                        "ask": tick.ask,
+                        "volume": tick.volume_real or 0.0,
+                    })
 
-            metrics["last_tick_time"] = time.time()
+                metrics["last_tick_time"] = time.time()
+
+            except Exception as e:
+                logger.error(f"Tick error {symbol}: {e}")
 
         time.sleep(TICK_POLL_INTERVAL)
 
@@ -183,24 +214,29 @@ def execution_loop():
             time.sleep(1)
             continue
 
-        with mt5_lock:
-            positions = mt5.positions_get()
+        try:
+            with mt5_lock:
+                positions = mt5.positions_get()
 
-        current = set(p.ticket for p in positions) if positions else set()
-        closed = last_positions - current
+            current = set(p.ticket for p in positions) if positions else set()
+            closed = last_positions - current
 
-        if closed:
-            with update_lock:
-                for ticket in closed:
-                    update_seq += 1
-                    update_buffer.append({
-                        "seq": update_seq,
-                        "event": "POSITION_CLOSED",
-                        "ticket": ticket,
-                        "ts": time.time()
-                    })
+            if closed:
+                with update_lock:
+                    for ticket in closed:
+                        update_seq += 1
+                        update_buffer.append({
+                            "seq": update_seq,
+                            "event": "POSITION_CLOSED",
+                            "ticket": ticket,
+                            "ts": time.time()
+                        })
 
-        last_positions = current
+            last_positions = current
+
+        except Exception as e:
+            logger.error(f"Execution loop error: {e}")
+
         time.sleep(POSITION_POLL_INTERVAL)
 
 # ============================================================
@@ -215,18 +251,23 @@ def account_loop():
             time.sleep(1)
             continue
 
-        with mt5_lock:
-            info = mt5.account_info()
+        try:
+            with mt5_lock:
+                info = mt5.account_info()
 
-        if info:
-            account_snapshot = {
-                "balance": info.balance,
-                "equity": info.equity,
-                "free_margin": info.margin_free,
-                "leverage": info.leverage,
-                "currency": info.currency,
-                "is_demo": info.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO,
-            }
+            if info:
+                account_snapshot = {
+                    "balance": info.balance,
+                    "equity": info.equity,
+                    "free_margin": info.margin_free,
+                    "margin": info.margin,
+                    "leverage": info.leverage,
+                    "currency": info.currency,
+                    "is_demo": info.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO,
+                }
+
+        except Exception as e:
+            logger.error(f"Account loop error: {e}")
 
         time.sleep(ACCOUNT_POLL_INTERVAL)
 
@@ -235,66 +276,11 @@ def account_loop():
 # ============================================================
 
 def require_auth(x_api_key: Optional[str]):
-    if x_api_key != API_KEY:
+    if not x_api_key or x_api_key != API_KEY:
         raise HTTPException(401, detail={"error": BridgeErrorCode.AUTH_FAILED})
 
 # ============================================================
-# ENDPOINTS
-# ============================================================
-
-@app.get("/heartbeat")
-def heartbeat():
-    return {
-        "status": "alive",
-        "mt5_connected": mt5_connected,
-        "circuit_breaker": circuit_breaker,
-        "tick_seq": tick_seq,
-        "update_seq": update_seq,
-        "metrics": metrics,
-        "timestamp": time.time(),
-    }
-
-@app.get("/account")
-def get_account(x_api_key: str = Header(None)):
-    require_auth(x_api_key)
-    return account_snapshot
-
-@app.get("/ticks")
-def get_ticks(after_seq: int = Query(0), x_api_key: str = Header(None)):
-    require_auth(x_api_key)
-
-    with tick_lock:
-        oldest = tick_seq - len(tick_buffer)
-
-        if after_seq < oldest:
-            raise HTTPException(409, detail={"error": BridgeErrorCode.DESYNC_DETECTED})
-
-        data = [t for t in tick_buffer if t["seq"] > after_seq]
-
-        return {
-            "last_seq": tick_seq,
-            "ticks": data[:MAX_TICKS_PER_RESPONSE],
-        }
-
-@app.get("/updates")
-def get_updates(after_seq: int = Query(0), x_api_key: str = Header(None)):
-    require_auth(x_api_key)
-
-    with update_lock:
-        oldest = update_seq - len(update_buffer)
-
-        if after_seq < oldest:
-            raise HTTPException(409, detail={"error": BridgeErrorCode.DESYNC_DETECTED})
-
-        data = [u for u in update_buffer if u["seq"] > after_seq]
-
-        return {
-            "last_seq": update_seq,
-            "updates": data[:MAX_UPDATES_PER_RESPONSE],
-        }
-
-# ============================================================
-# ORDER ENGINE
+# ORDER MODEL
 # ============================================================
 
 class OrderRequest(BaseModel):
@@ -303,6 +289,10 @@ class OrderRequest(BaseModel):
     volume: float = Field(gt=0)
     sl: float
     tp: float
+
+# ============================================================
+# ORDER ENGINE
+# ============================================================
 
 @app.post("/order")
 def send_order(req: OrderRequest, x_api_key: str = Header(None)):
@@ -316,13 +306,30 @@ def send_order(req: OrderRequest, x_api_key: str = Header(None)):
     if circuit_breaker:
         raise HTTPException(503, detail={"error": BridgeErrorCode.CIRCUIT_BREAKER})
 
+    if req.symbol not in SYMBOLS:
+        raise HTTPException(400, detail={"error": BridgeErrorCode.INVALID_SYMBOL})
+
     with mt5_lock:
         info = mt5.symbol_info(req.symbol)
         tick = mt5.symbol_info_tick(req.symbol)
 
+    if not info or not tick:
+        raise HTTPException(400, detail={"error": BridgeErrorCode.INVALID_SYMBOL})
+
     spread = abs(tick.ask - tick.bid) / info.point
     if spread > MAX_SPREAD_POINTS:
         raise HTTPException(400, detail={"error": BridgeErrorCode.SPREAD_TOO_WIDE})
+
+    with mt5_lock:
+        margin_check = mt5.order_calc_margin(
+            mt5.ORDER_TYPE_BUY,
+            req.symbol,
+            req.volume,
+            tick.ask
+        )
+
+    if margin_check and margin_check > account_snapshot.get("free_margin", 0):
+        raise HTTPException(400, detail={"error": BridgeErrorCode.MARGIN_INSUFFICIENT})
 
     price = tick.ask if req.type == mt5.ORDER_TYPE_BUY else tick.bid
 
@@ -349,6 +356,9 @@ def send_order(req: OrderRequest, x_api_key: str = Header(None)):
     metrics["avg_order_latency_ms"] = (
         metrics["avg_order_latency_ms"] * 0.9 + latency * 0.1
     )
+
+    if not result:
+        raise HTTPException(500, detail={"error": BridgeErrorCode.BROKER_REJECT})
 
     if latency > MAX_ORDER_LATENCY_MS:
         circuit_breaker = True
@@ -378,10 +388,27 @@ def send_order(req: OrderRequest, x_api_key: str = Header(None)):
     return {"status": "ok", "ticket": result.order, "latency_ms": latency}
 
 # ============================================================
-# START THREADS
+# HEARTBEAT
+# ============================================================
+
+@app.get("/heartbeat")
+def heartbeat():
+    return {
+        "status": "alive",
+        "mt5_connected": mt5_connected,
+        "circuit_breaker": circuit_breaker,
+        "tick_seq": tick_seq,
+        "update_seq": update_seq,
+        "metrics": metrics,
+        "timestamp": time.time(),
+    }
+
+# ============================================================
+# START THREADS (SAFE SINGLE INIT)
 # ============================================================
 
 init_mt5()
+
 threading.Thread(target=watchdog, daemon=True).start()
 threading.Thread(target=tick_loop, daemon=True).start()
 threading.Thread(target=execution_loop, daemon=True).start()
