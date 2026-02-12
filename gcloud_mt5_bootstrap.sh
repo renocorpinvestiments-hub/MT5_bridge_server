@@ -1,3 +1,109 @@
+# gcloud_mt5_bootstrap.sh
+#!/bin/bash
+set -Eeuo pipefail
+
+# ==========================================================
+# INSTITUTIONAL GOOGLE CLOUD MT5 + BRIDGE BOOTSTRAP
+# One-click setup for MetaTrader 5 + FastAPI Bridge
+# ==========================================================
+
+APP_NAME="mt5_bridge"
+APP_USER="mt5bot"
+APP_DIR="/opt/MT5_BRIDGE"
+SERVICE_FILE="/etc/systemd/system/mt5_bridge.service"
+ENV_FILE="/etc/mt5_bridge_env"
+
+echo "======================================================"
+echo "🚀 Bootstrapping Google Cloud MT5 + Bridge Environment"
+echo "======================================================"
+
+# ----------------------------------------------------------
+# 1) Create dedicated user
+# ----------------------------------------------------------
+echo "[1/8] Creating service user..."
+if ! id "$APP_USER" &>/dev/null; then
+  useradd -m -s /bin/bash "$APP_USER"
+fi
+
+mkdir -p "$APP_DIR"
+chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+
+# ----------------------------------------------------------
+# 2) Install system dependencies
+# ----------------------------------------------------------
+echo "[2/8] Installing system dependencies..."
+
+apt-get update
+apt-get install -y \
+  wget \
+  curl \
+  unzip \
+  software-properties-common \
+  python3 \
+  python3-venv \
+  python3-pip \
+  xvfb \
+  winbind \
+  wine64 \
+  cabextract \
+  fonts-wine \
+  mesa-utils \
+  dbus-x11 \
+  supervisor
+
+# ----------------------------------------------------------
+# 3) Install MetaTrader 5 (Headless + auto-login capable)
+# ----------------------------------------------------------
+echo "[3/8] Installing MetaTrader 5 via Wine..."
+
+sudo -u "$APP_USER" bash <<EOF
+set -e
+export WINEPREFIX=/home/$APP_USER/.wine
+export DISPLAY=:99
+
+# Start virtual display for headless MT5
+Xvfb :99 -screen 0 1024x768x16 &
+
+# Download official MT5 installer
+wget -O /home/$APP_USER/mt5setup.exe \
+  https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe
+
+# Install MT5 silently
+wine64 /home/$APP_USER/mt5setup.exe /silent /auto
+
+echo "MetaTrader 5 installed in Wine environment."
+EOF
+
+# ----------------------------------------------------------
+# 4) Create secure environment file
+# ----------------------------------------------------------
+echo "[4/8] Creating secure environment config..."
+
+cat > "$ENV_FILE" <<EOF
+# ==== MT5 Credentials ====
+MT5_LOGIN=YOUR_MT5_LOGIN
+MT5_PASSWORD=YOUR_MT5_PASSWORD
+MT5_SERVER=YOUR_MT5_SERVER
+
+# ==== Bridge Security ====
+BRIDGE_API_KEY=super-secret-key-change-me
+
+# ==== Trading config ====
+SYMBOLS=EURUSD,GBPUSD,XAUUSD
+MAGIC_NUMBER=987654
+EOF
+
+chmod 600 "$ENV_FILE"
+chown "$APP_USER:$APP_USER" "$ENV_FILE"
+
+echo "⚠️  IMPORTANT: Edit /etc/mt5_bridge_env with your real credentials!"
+
+# ----------------------------------------------------------
+# 5) Deploy your bridge code
+# ----------------------------------------------------------
+echo "[5/8] Preparing application directory..."
+
+cat > "$APP_DIR/mt5_bridge_server.py" <<'EOF'
 # ============================================================
 # INSTITUTIONAL MT5 EXECUTION BRIDGE (PRODUCTION SAFE)
 # Google Cloud Deployment
@@ -463,3 +569,73 @@ def start_background_threads():
     threading.Thread(target=account_loop, daemon=True).start()
 
 start_background_threads()
+
+
+EOF
+
+chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+
+# ----------------------------------------------------------
+# 6) Create Python virtual environment + install deps
+# ----------------------------------------------------------
+echo "[6/8] Setting up Python environment..."
+
+sudo -u "$APP_USER" bash <<EOF
+set -e
+cd $APP_DIR
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+pip install --upgrade pip
+pip install fastapi uvicorn MetaTrader5
+
+EOF
+
+# ----------------------------------------------------------
+# 7) Create production systemd service (auto-start)
+# ----------------------------------------------------------
+echo "[7/8] Creating systemd service..."
+
+cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=MT5 FastAPI Bridge (Production)
+After=network.target
+
+[Service]
+User=$APP_USER
+Group=$APP_USER
+WorkingDirectory=$APP_DIR
+EnvironmentFile=$ENV_FILE
+
+ExecStart=$APP_DIR/.venv/bin/uvicorn mt5_bridge_server:app \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --workers 4 \
+  --log-level info
+
+Restart=always
+RestartSec=3
+LimitNOFILE=100000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reexec
+systemctl enable mt5_bridge.service
+
+# ----------------------------------------------------------
+# 8) Start everything
+# ----------------------------------------------------------
+echo "[8/8] Starting services..."
+
+systemctl start mt5_bridge.service
+
+echo "======================================================"
+echo "✅ SETUP COMPLETE"
+echo "Bridge running on: http://<YOUR_GCLOUD_IP>:8000"
+echo "Edit credentials in: /etc/mt5_bridge_env"
+echo "Check status: systemctl status mt5_bridge"
+echo "View logs: journalctl -u mt5_bridge -f"
+echo "======================================================"
