@@ -611,7 +611,7 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$APP_DIR/.venv/bin/uvicorn mt5_bridge_server:app \
   --host 0.0.0.0 \
   --port 8000 \
-  --workers 4 \
+  --workers 1 \
   --log-level info
 
 Restart=always
