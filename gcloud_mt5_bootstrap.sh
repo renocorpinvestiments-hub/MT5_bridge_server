@@ -81,12 +81,12 @@ echo "[4/8] Creating secure environment config..."
 
 cat > "$ENV_FILE" <<EOF
 # ==== MT5 Credentials ====
-MT5_LOGIN=YOUR_MT5_LOGIN
-MT5_PASSWORD=YOUR_MT5_PASSWORD
-MT5_SERVER=YOUR_MT5_SERVER
+MT5_LOGIN=81584760
+MT5_PASSWORD=Black@256
+MT5_SERVER=Exness-MT5Trial10
 
 # ==== Bridge Security ====
-BRIDGE_API_KEY=super-secret-key-change-me
+BRIDGE_API_KEY=b78a2d5ac7c66bfd98315ed095408cfe
 
 # ==== Trading config ====
 SYMBOLS=EURUSD,GBPUSD,XAUUSD,BTCUSD,NAS100,SPX500,ETHUSD,USDJPY,USDCAD,XAGUSD,GBPUSD
